@@ -6,10 +6,12 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.soap4tv.app.data.model.Episode
 import com.soap4tv.app.data.model.PlaybackData
 import com.soap4tv.app.data.repository.CatalogRepository
 import com.soap4tv.app.data.repository.MovieRepository
 import com.soap4tv.app.data.repository.PlayerRepository
+import com.soap4tv.app.data.repository.SeriesRepository
 import com.soap4tv.app.data.repository.WatchProgressRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.launch
@@ -20,6 +22,7 @@ class PlayerViewModel @Inject constructor(
     private val playerRepository: PlayerRepository,
     private val movieRepository: MovieRepository,
     private val catalogRepository: CatalogRepository,
+    private val seriesRepository: SeriesRepository,
     private val watchProgressRepository: WatchProgressRepository,
     val okHttpClient: okhttp3.OkHttpClient,
     savedStateHandle: SavedStateHandle
@@ -40,15 +43,28 @@ class PlayerViewModel @Inject constructor(
     private var episodeNumber: Int = 0
     private var seriesTitle: String = ""
 
+    // Episode list for autoplay
+    private var episodeList: List<Episode> = emptyList()
+    private var currentEpisodeEid: String = ""
+    var hasNextEpisode by mutableStateOf(false)
+        private set
+
     init {
         // Auto-load from nav args via SavedStateHandle
         val eid = savedStateHandle.get<String>("eid")
         val sid = savedStateHandle.get<String>("sid")
         val hash = savedStateHandle.get<String>("hash")
+        val slug = savedStateHandle.get<String>("slug")
+        val season = savedStateHandle.get<Int>("season")
         val movieId = savedStateHandle.get<Int>("id")
 
         when {
-            eid != null && sid != null && hash != null -> loadSeriesEpisode(eid, sid, hash)
+            eid != null && sid != null && hash != null -> {
+                loadSeriesEpisode(eid, sid, hash)
+                if (slug != null && season != null) {
+                    loadEpisodeList(slug, season, eid)
+                }
+            }
             movieId != null -> loadMovie(movieId)
             else -> { isLoading = false; error = "No playback source" }
         }
@@ -108,6 +124,34 @@ class PlayerViewModel @Inject constructor(
                 .onFailure { error = it.message }
             isLoading = false
         }
+    }
+
+    private fun loadEpisodeList(slug: String, season: Int, currentEid: String) {
+        currentEpisodeEid = currentEid
+        viewModelScope.launch {
+            seriesRepository.getEpisodes(slug, season)
+                .onSuccess { list ->
+                    episodeList = list.filter { it.canPlay }
+                    updateHasNext()
+                }
+        }
+    }
+
+    private fun updateHasNext() {
+        val idx = episodeList.indexOfFirst { it.eid == currentEpisodeEid }
+        hasNextEpisode = idx >= 0 && idx < episodeList.size - 1
+    }
+
+    fun playNextEpisode() {
+        val idx = episodeList.indexOfFirst { it.eid == currentEpisodeEid }
+        if (idx < 0 || idx >= episodeList.size - 1) return
+        val next = episodeList[idx + 1]
+        val eid = next.eid ?: return
+        val sid = next.sid ?: return
+        val hash = next.hash ?: return
+        currentEpisodeEid = eid
+        updateHasNext()
+        loadSeriesEpisode(eid, sid, hash)
     }
 
     fun saveProgress(

@@ -26,14 +26,14 @@ object Routes {
     const val SERIES_DETAIL = "series/{slug}"
     const val EPISODES = "episodes/{slug}/{season}"
     const val MOVIE_DETAIL = "movie/{id}"
-    const val PLAYER_SERIES = "player/series/{eid}/{sid}/{hash}"
+    const val PLAYER_SERIES = "player/series/{eid}/{sid}/{hash}/{slug}/{season}"
     const val PLAYER_MOVIE = "player/movie/{id}"
     const val SEARCH = "search"
 
     fun seriesDetail(slug: String) = "series/$slug"
     fun episodes(slug: String, season: Int) = "episodes/$slug/$season"
     fun movieDetail(id: Int) = "movie/$id"
-    fun playerSeries(eid: String, sid: String, hash: String) = "player/series/$eid/$sid/$hash"
+    fun playerSeries(eid: String, sid: String, hash: String, slug: String, season: Int) = "player/series/$eid/$sid/$hash/$slug/$season"
     fun playerMovie(id: Int) = "player/movie/$id"
 }
 
@@ -96,7 +96,7 @@ fun AppNavigation(authState: AuthState) {
                 slug = slug,
                 season = season,
                 onEpisodeClick = { eid, sid, hash ->
-                    navController.navigate(Routes.playerSeries(eid, sid, hash))
+                    navController.navigate(Routes.playerSeries(eid, sid, hash, slug, season))
                 },
                 onBack = { navController.popBackStack() }
             )
@@ -119,7 +119,9 @@ fun AppNavigation(authState: AuthState) {
             arguments = listOf(
                 navArgument("eid") { type = NavType.StringType },
                 navArgument("sid") { type = NavType.StringType },
-                navArgument("hash") { type = NavType.StringType }
+                navArgument("hash") { type = NavType.StringType },
+                navArgument("slug") { type = NavType.StringType },
+                navArgument("season") { type = NavType.IntType }
             )
         ) { backStackEntry ->
             PlayerScreen(

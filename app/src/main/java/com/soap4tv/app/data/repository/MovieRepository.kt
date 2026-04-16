@@ -3,6 +3,9 @@ package com.soap4tv.app.data.repository
 import com.soap4tv.app.data.model.MovieDetail
 import com.soap4tv.app.data.network.SoapApiClient
 import com.soap4tv.app.data.parser.MovieDetailParser
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -11,14 +14,20 @@ class MovieRepository @Inject constructor(
     private val apiClient: SoapApiClient,
     private val authRepository: AuthRepository
 ) {
-    private val detailCache = mutableMapOf<Int, MovieDetail>()
+    private val detailCache = ConcurrentHashMap<Int, MovieDetail>()
+    private val detailLock = Mutex()
 
     suspend fun getMovieDetail(id: Int, forceRefresh: Boolean = false): Result<MovieDetail> {
         if (!forceRefresh) {
             detailCache[id]?.let { return Result.success(it) }
         }
-        return apiClient.fetchPage("/movies/$id/").map { html ->
-            MovieDetailParser.parseMovieDetail(html, id).also { detailCache[id] = it }
+        return detailLock.withLock {
+            if (!forceRefresh) {
+                detailCache[id]?.let { return@withLock Result.success(it) }
+            }
+            apiClient.fetchPage("/movies/$id/").map { html ->
+                MovieDetailParser.parseMovieDetail(html, id).also { detailCache[id] = it }
+            }
         }
     }
 

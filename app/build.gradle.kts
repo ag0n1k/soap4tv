@@ -13,14 +13,15 @@ android {
     defaultConfig {
         applicationId = "com.soap4tv.app"
         minSdk = 23
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0"
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -39,6 +40,16 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    lint {
+        // AGP 8.7.3 ships a lint that crashes on compileSdk=36 with Kotlin
+        // analysis-API NoSuchMethodError. Disable the known-broken detector
+        // until we upgrade AGP.
+        disable += "NullSafeMutableLiveData"
+        // Don't fail the release build on lint issues — we still run it manually.
+        abortOnError = false
+        checkReleaseBuilds = false
     }
 }
 

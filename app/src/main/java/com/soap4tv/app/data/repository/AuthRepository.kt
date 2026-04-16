@@ -12,6 +12,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -28,9 +30,11 @@ class AuthRepository @Inject constructor(
     private val _authState = MutableStateFlow<AuthState>(AuthState.Unknown)
     val authState: StateFlow<AuthState> = _authState.asStateFlow()
 
-    // In-memory token cache — re-fetched from HTML when needed
+    // In-memory token cache — re-fetched from HTML when needed.
+    // Mutex guards refresh so concurrent callers coalesce onto a single network round-trip.
     @Volatile
     private var cachedToken: String? = null
+    private val tokenMutex = Mutex()
 
     /**
      * Check if a valid session exists on startup.
@@ -96,13 +100,18 @@ class AuthRepository @Inject constructor(
      */
     suspend fun getToken(): String? {
         cachedToken?.let { return it }
-        return refreshToken()
+        return tokenMutex.withLock {
+            // Another caller might have populated the token while we awaited the lock.
+            cachedToken ?: refreshTokenLocked()
+        }
     }
 
     /**
-     * Force re-fetch the token from main page.
+     * Force re-fetch the token from main page. Concurrent callers share one network round-trip.
      */
-    suspend fun refreshToken(): String? {
+    suspend fun refreshToken(): String? = tokenMutex.withLock { refreshTokenLocked() }
+
+    private suspend fun refreshTokenLocked(): String? {
         return try {
             val html = apiClient.fetchPage("/").getOrElse { return null }
             if (TokenParser.isAuthenticated(html)) {
@@ -116,7 +125,7 @@ class AuthRepository @Inject constructor(
                 cachedToken = null
                 null
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
     }

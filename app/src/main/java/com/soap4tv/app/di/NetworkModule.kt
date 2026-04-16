@@ -3,6 +3,7 @@ package com.soap4tv.app.di
 import android.app.Application
 import coil3.ImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
+import com.soap4tv.app.data.network.RetryInterceptor
 import com.soap4tv.app.data.network.SoapCookieJar
 import dagger.Module
 import dagger.Provides
@@ -25,6 +26,7 @@ object NetworkModule {
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
             .followRedirects(true)
+            .addInterceptor(RetryInterceptor())
             .build()
     }
 

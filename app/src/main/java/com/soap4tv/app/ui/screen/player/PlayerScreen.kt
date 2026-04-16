@@ -5,13 +5,18 @@ import androidx.annotation.OptIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.unit.dp
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.foundation.focusable
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -43,21 +48,32 @@ fun PlayerScreen(
     var positionMs by remember { mutableStateOf(0L) }
     var durationMs by remember { mutableStateOf(0L) }
     var audioTracks by remember { mutableStateOf<List<String>>(emptyList()) }
+    var subtitleTracks by remember { mutableStateOf<List<String>>(emptyList()) }
     var selectedAudioTrack by remember { mutableStateOf(0) }
     var selectedSubtitleTrack by remember { mutableStateOf(0) }
+    var pendingSeekMs by remember { mutableStateOf(0L) }
+    var userAdjustedSeek by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     var hideOverlayJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    val playerFocusRequester = remember { FocusRequester() }
+    val overlayFocusRequester = remember { FocusRequester() }
 
-    // Auto-hide overlay after 3s of inactivity
+    fun hideOverlay() {
+        hideOverlayJob?.cancel()
+        showOverlay = false
+    }
+
     fun scheduleHideOverlay() {
         hideOverlayJob?.cancel()
         hideOverlayJob = scope.launch {
-            delay(3_000)
+            delay(5_000)
             showOverlay = false
         }
     }
 
-    fun showOverlayAndScheduleHide() {
+    fun showOverlayFn() {
+        pendingSeekMs = positionMs
+        userAdjustedSeek = false
         showOverlay = true
         scheduleHideOverlay()
     }
@@ -95,6 +111,11 @@ fun PlayerScreen(
                 override fun onIsPlayingChanged(playing: Boolean) {
                     isPlaying = playing
                 }
+                override fun onPlaybackStateChanged(state: Int) {
+                    if (state == Player.STATE_ENDED && viewModel.hasNextEpisode) {
+                        viewModel.playNextEpisode()
+                    }
+                }
                 override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
                     val names = mutableListOf<String>()
                     for (group in tracks.groups) {
@@ -107,32 +128,45 @@ fun PlayerScreen(
                         }
                     }
                     audioTracks = names
+
+                    val subNames = mutableListOf<String>()
+                    for (group in tracks.groups) {
+                        if (group.type == C.TRACK_TYPE_TEXT && group.isSupported) {
+                            for (i in 0 until group.length) {
+                                val format = group.getTrackFormat(i)
+                                val label = format.label ?: format.language ?: "Sub ${subNames.size + 1}"
+                                subNames.add(label)
+                            }
+                        }
+                    }
+                    subtitleTracks = subNames
                 }
             })
         }
     }
 
-    // Position tracking + progress save
+    // Position tracking (every 1s) + progress save (every 30s) driven by a single coroutine.
+    // Tied to exoPlayer key — cancels + restarts cleanly on episode switch.
     LaunchedEffect(exoPlayer) {
-        if (exoPlayer == null) return@LaunchedEffect
+        val player = exoPlayer ?: return@LaunchedEffect
+        var ticks = 0
         while (true) {
             delay(1_000)
-            if (exoPlayer.isPlaying) {
-                positionMs = exoPlayer.currentPosition
-                durationMs = exoPlayer.duration.coerceAtLeast(0)
+            if (player.isPlaying) {
+                positionMs = player.currentPosition
+                durationMs = player.duration.coerceAtLeast(0)
+                if (!userAdjustedSeek) {
+                    pendingSeekMs = positionMs
+                }
+                ticks++
+                if (ticks >= 30) {
+                    ticks = 0
+                    viewModel.saveProgress(
+                        positionMs = player.currentPosition,
+                        durationMs = player.duration.coerceAtLeast(0)
+                    )
+                }
             }
-        }
-    }
-
-    // Save progress every 30s
-    LaunchedEffect(exoPlayer) {
-        if (exoPlayer == null) return@LaunchedEffect
-        while (true) {
-            delay(30_000)
-            viewModel.saveProgress(
-                positionMs = exoPlayer.currentPosition,
-                durationMs = exoPlayer.duration.coerceAtLeast(0)
-            )
         }
     }
 
@@ -148,60 +182,70 @@ fun PlayerScreen(
         }
     }
 
-    // Show overlay on start
-    LaunchedEffect(Unit) {
-        scheduleHideOverlay()
+    // Reset state when a new episode starts (autoplay)
+    LaunchedEffect(playbackData) {
+        showOverlay = false
+        userAdjustedSeek = false
+        positionMs = 0L
+        pendingSeekMs = 0L
+    }
+
+    // Manage focus when overlay visibility changes
+    LaunchedEffect(showOverlay) {
+        if (showOverlay) {
+            delay(100) // Wait for AnimatedVisibility to compose elements
+            try { overlayFocusRequester.requestFocus() } catch (_: Exception) {}
+        } else {
+            try { playerFocusRequester.requestFocus() } catch (_: Exception) {}
+        }
     }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .onKeyEvent { event ->
-                if (event.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onKeyEvent false
-                when (event.nativeKeyEvent.keyCode) {
-                    KeyEvent.KEYCODE_DPAD_CENTER,
-                    KeyEvent.KEYCODE_ENTER -> {
-                        if (showOverlay) {
+            .onPreviewKeyEvent { event ->
+                if (event.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
+
+                if (!showOverlay) {
+                    // Overlay hidden: handle all keys ourselves
+                    when (event.nativeKeyEvent.keyCode) {
+                        KeyEvent.KEYCODE_DPAD_CENTER,
+                        KeyEvent.KEYCODE_ENTER -> {
                             exoPlayer?.let { p ->
                                 if (p.isPlaying) p.pause() else p.play()
                             }
+                            true
                         }
-                        showOverlayAndScheduleHide()
-                        true
-                    }
-                    KeyEvent.KEYCODE_DPAD_LEFT -> {
-                        if (showOverlay) {
+                        KeyEvent.KEYCODE_DPAD_LEFT -> {
                             exoPlayer?.seekTo((exoPlayer.currentPosition - 10_000).coerceAtLeast(0))
+                            true
                         }
-                        showOverlayAndScheduleHide()
-                        true
-                    }
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                        if (showOverlay) {
+                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
                             val dur = exoPlayer?.duration ?: Long.MAX_VALUE
                             exoPlayer?.seekTo(
                                 (exoPlayer.currentPosition + 10_000).coerceAtMost(dur)
                             )
+                            true
                         }
-                        showOverlayAndScheduleHide()
-                        true
+                        KeyEvent.KEYCODE_BACK,
+                        KeyEvent.KEYCODE_ESCAPE -> {
+                            showOverlayFn()
+                            true
+                        }
+                        else -> false
                     }
-                    KeyEvent.KEYCODE_DPAD_UP,
-                    KeyEvent.KEYCODE_DPAD_DOWN -> {
-                        showOverlayAndScheduleHide()
-                        false // let focus handling continue
-                    }
-                    KeyEvent.KEYCODE_BACK,
-                    KeyEvent.KEYCODE_ESCAPE -> {
-                        if (showOverlay) {
+                } else {
+                    // Overlay visible: reset auto-hide on any key, handle back
+                    scheduleHideOverlay()
+                    when (event.nativeKeyEvent.keyCode) {
+                        KeyEvent.KEYCODE_BACK,
+                        KeyEvent.KEYCODE_ESCAPE -> {
                             onBack()
-                        } else {
-                            showOverlayAndScheduleHide()
+                            true
                         }
-                        true
+                        else -> false
                     }
-                    else -> false
                 }
             }
     ) {
@@ -217,11 +261,22 @@ fun PlayerScreen(
                 }
             }
             exoPlayer != null -> {
+                // Invisible focus catcher — receives key events when overlay is hidden
+                Box(
+                    modifier = Modifier
+                        .size(1.dp)
+                        .focusRequester(playerFocusRequester)
+                        .focusable()
+                )
+
                 AndroidView(
                     factory = { ctx ->
                         PlayerView(ctx).apply {
                             player = exoPlayer
                             useController = false
+                            isFocusable = false
+                            isFocusableInTouchMode = false
+                            keepScreenOn = true
                         }
                     },
                     modifier = Modifier.fillMaxSize()
@@ -229,26 +284,45 @@ fun PlayerScreen(
 
                 PlayerOverlay(
                     isVisible = showOverlay,
+                    playPauseFocusRequester = overlayFocusRequester,
                     title = playbackData?.title ?: "",
                     isPlaying = isPlaying,
-                    positionMs = positionMs,
+                    pendingSeekMs = pendingSeekMs,
                     durationMs = durationMs,
-                    hasSubtitles = (playbackData?.subtitles?.isNotEmpty() == true),
+                    subtitleTracks = subtitleTracks,
                     audioTracks = audioTracks,
                     selectedAudioTrack = selectedAudioTrack,
                     selectedSubtitleTrack = selectedSubtitleTrack,
                     onPlayPause = {
-                        if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
-                        showOverlayAndScheduleHide()
+                        if (exoPlayer.isPlaying) {
+                            exoPlayer.pause()
+                        } else {
+                            // Apply pending seek if changed
+                            if (pendingSeekMs != exoPlayer.currentPosition) {
+                                exoPlayer.seekTo(pendingSeekMs)
+                            }
+                            exoPlayer.play()
+                            hideOverlay()
+                        }
                     },
-                    onSeekBack = {
-                        exoPlayer.seekTo((exoPlayer.currentPosition - 10_000).coerceAtLeast(0))
-                        showOverlayAndScheduleHide()
+                    onRestart = {
+                        exoPlayer.seekTo(0)
+                        pendingSeekMs = 0
+                        userAdjustedSeek = false
+                        exoPlayer.play()
+                        hideOverlay()
                     },
-                    onSeekForward = {
+                    onSkipToEnd = {
+                        if (viewModel.hasNextEpisode) {
+                            viewModel.playNextEpisode()
+                        } else {
+                            exoPlayer.seekTo(exoPlayer.duration)
+                        }
+                    },
+                    onAdjustMinute = { minutes ->
                         val dur = exoPlayer.duration.coerceAtLeast(0)
-                        exoPlayer.seekTo((exoPlayer.currentPosition + 10_000).coerceAtMost(dur))
-                        showOverlayAndScheduleHide()
+                        pendingSeekMs = (pendingSeekMs + minutes * 60_000L).coerceIn(0, dur)
+                        userAdjustedSeek = true
                     },
                     onSelectAudio = { index ->
                         selectedAudioTrack = index
@@ -270,16 +344,37 @@ fun PlayerScreen(
                                 trackIdx++
                             }
                         }
-                        showOverlayAndScheduleHide()
+                        // overlay stays visible
                     },
                     onSelectSubtitle = { index ->
                         selectedSubtitleTrack = index
-                        val params = exoPlayer.trackSelectionParameters.buildUpon()
                         if (index < 0) {
-                            params.setIgnoredTextSelectionFlags(C.SELECTION_FLAG_DEFAULT)
+                            exoPlayer.trackSelectionParameters =
+                                exoPlayer.trackSelectionParameters.buildUpon()
+                                    .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                                    .build()
+                        } else {
+                            val tracks = exoPlayer.currentTracks
+                            var trackIdx = 0
+                            for (group in tracks.groups) {
+                                if (group.type == C.TRACK_TYPE_TEXT && group.isSupported) {
+                                    if (trackIdx == index) {
+                                        exoPlayer.trackSelectionParameters =
+                                            exoPlayer.trackSelectionParameters.buildUpon()
+                                                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                                                .setOverrideForType(
+                                                    androidx.media3.common.TrackSelectionOverride(
+                                                        group.mediaTrackGroup, 0
+                                                    )
+                                                )
+                                                .build()
+                                        break
+                                    }
+                                    trackIdx++
+                                }
+                            }
                         }
-                        exoPlayer.trackSelectionParameters = params.build()
-                        showOverlayAndScheduleHide()
+                        // overlay stays visible
                     },
                     onBack = onBack,
                     modifier = Modifier.fillMaxSize()

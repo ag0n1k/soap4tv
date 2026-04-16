@@ -1,5 +1,6 @@
 package com.soap4tv.app.data.parser
 
+import android.util.Log
 import com.soap4tv.app.data.model.MovieDetail
 import com.soap4tv.app.data.model.SubtitleTrack
 import com.soap4tv.app.data.network.SoapApiClient
@@ -7,10 +8,25 @@ import org.jsoup.Jsoup
 
 object MovieDetailParser {
 
-    private val HLS_REGEX = Regex("""file\s*:\s*"(https?://[^"]+)"""")
+    private const val TAG = "MovieDetailParser"
+
+    // Playerjs JS config: try several formats. Single- and double-quoted plus the m3u8 shortcut.
+    private val HLS_REGEXES = listOf(
+        Regex("""file\s*:\s*"(https?://[^"]+)""""),
+        Regex("""file\s*:\s*'(https?://[^']+)'"""),
+        Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']""")
+    )
     private val SUBTITLE_REGEX = Regex("""subtitle\s*:\s*'([^']+)'""")
     private val POSTER_REGEX = Regex("""poster\s*:\s*"(/[^"]+)"""")
     private val TITLE_REGEX = Regex("""title\s*:\s*"([^"]+)"""")
+
+    private fun extractHlsUrl(html: String, movieId: Int): String {
+        for (re in HLS_REGEXES) {
+            re.find(html)?.let { return it.groupValues[1] }
+        }
+        Log.w(TAG, "No HLS URL found for movie id=$movieId; Playerjs config may have changed")
+        return ""
+    }
 
     fun parseMovieDetail(html: String, id: Int): MovieDetail {
         val doc = Jsoup.parse(html)
@@ -19,8 +35,8 @@ object MovieDetailParser {
         val pageTitle = doc.selectFirst("title")?.text()
             ?.substringBefore("|")?.trim() ?: ""
 
-        // HLS URL embedded in JS
-        val hlsUrl = HLS_REGEX.find(html)?.groupValues?.get(1) ?: ""
+        // HLS URL embedded in Playerjs JS config — try several regexes with logged fallback.
+        val hlsUrl = extractHlsUrl(html, id)
 
         // Subtitles: '[Русский]/assets/subsm/817/ru.srt,[English]/assets/subsm/817/en.srt'
         val subtitleStr = SUBTITLE_REGEX.find(html)?.groupValues?.get(1) ?: ""

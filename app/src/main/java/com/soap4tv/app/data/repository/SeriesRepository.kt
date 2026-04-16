@@ -5,6 +5,9 @@ import com.soap4tv.app.data.model.SeriesDetail
 import com.soap4tv.app.data.network.SoapApiClient
 import com.soap4tv.app.data.parser.EpisodeListParser
 import com.soap4tv.app.data.parser.SeriesDetailParser
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -13,15 +16,22 @@ class SeriesRepository @Inject constructor(
     private val apiClient: SoapApiClient,
     private val authRepository: AuthRepository
 ) {
-    private val detailCache = mutableMapOf<String, SeriesDetail>()
-    private val episodeCache = mutableMapOf<String, List<Episode>>()
+    private val detailCache = ConcurrentHashMap<String, SeriesDetail>()
+    private val episodeCache = ConcurrentHashMap<String, List<Episode>>()
+    private val detailLock = Mutex()
+    private val episodeLock = Mutex()
 
     suspend fun getSeriesDetail(slug: String, forceRefresh: Boolean = false): Result<SeriesDetail> {
         if (!forceRefresh) {
             detailCache[slug]?.let { return Result.success(it) }
         }
-        return apiClient.fetchPage("/soap/$slug/").map { html ->
-            SeriesDetailParser.parseSeriesDetail(html, slug).also { detailCache[slug] = it }
+        return detailLock.withLock {
+            if (!forceRefresh) {
+                detailCache[slug]?.let { return@withLock Result.success(it) }
+            }
+            apiClient.fetchPage("/soap/$slug/").map { html ->
+                SeriesDetailParser.parseSeriesDetail(html, slug).also { detailCache[slug] = it }
+            }
         }
     }
 
@@ -34,9 +44,14 @@ class SeriesRepository @Inject constructor(
         if (!forceRefresh) {
             episodeCache[key]?.let { return Result.success(it) }
         }
-        return apiClient.fetchPage("/soap/$slug/$season/").map { html ->
-            val (_, episodes) = EpisodeListParser.parseEpisodes(html)
-            episodes.also { episodeCache[key] = it }
+        return episodeLock.withLock {
+            if (!forceRefresh) {
+                episodeCache[key]?.let { return@withLock Result.success(it) }
+            }
+            apiClient.fetchPage("/soap/$slug/$season/").map { html ->
+                val (_, episodes) = EpisodeListParser.parseEpisodes(html)
+                episodes.also { episodeCache[key] = it }
+            }
         }
     }
 

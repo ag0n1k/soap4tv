@@ -22,7 +22,11 @@ object DatabaseModule {
             context,
             AppDatabase::class.java,
             "soap4tv.db"
-        ).build()
+        )
+            // Watch-progress is a local cache — rebuilding it after a schema bump
+            // is acceptable and avoids crashing users on upgrade until we ship proper migrations.
+            .fallbackToDestructiveMigration(false)
+            .build()
     }
 
     @Provides

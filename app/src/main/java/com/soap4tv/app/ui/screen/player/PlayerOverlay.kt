@@ -3,38 +3,47 @@ package com.soap4tv.app.ui.screen.player
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import android.view.KeyEvent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.soap4tv.app.ui.theme.*
 
 @Composable
 fun PlayerOverlay(
     isVisible: Boolean,
+    playPauseFocusRequester: FocusRequester,
     title: String,
     isPlaying: Boolean,
-    positionMs: Long,
+    pendingSeekMs: Long,
     durationMs: Long,
-    hasSubtitles: Boolean,
+    subtitleTracks: List<String>,
     audioTracks: List<String>,
     selectedAudioTrack: Int,
     selectedSubtitleTrack: Int,
     onPlayPause: () -> Unit,
-    onSeekBack: () -> Unit,
-    onSeekForward: () -> Unit,
+    onRestart: () -> Unit,
+    onSkipToEnd: () -> Unit,
+    onAdjustMinute: (Int) -> Unit,
     onSelectAudio: (Int) -> Unit,
     onSelectSubtitle: (Int) -> Unit,
     onBack: () -> Unit,
@@ -49,7 +58,7 @@ fun PlayerOverlay(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.6f))
+                .background(Color.Black.copy(alpha = 0.75f))
         ) {
             // Back button top-left
             var backFocused by remember { mutableStateOf(false) }
@@ -65,7 +74,7 @@ fun PlayerOverlay(
                     )
             ) {
                 Icon(
-                    imageVector = Icons.Default.ArrowBack,
+                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                     contentDescription = "Back",
                     tint = if (backFocused) Accent else Color.White,
                     modifier = Modifier.size(28.dp)
@@ -89,20 +98,21 @@ fun PlayerOverlay(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 OverlayButton(
-                    icon = Icons.Default.SkipPrevious,
-                    description = "Rewind 10s",
-                    onClick = onSeekBack
+                    icon = Icons.Default.Replay,
+                    description = "Restart",
+                    onClick = onRestart
                 )
                 OverlayButton(
                     icon = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                     description = if (isPlaying) "Pause" else "Play",
                     onClick = onPlayPause,
-                    size = 64.dp
+                    size = 64.dp,
+                    focusRequester = playPauseFocusRequester
                 )
                 OverlayButton(
                     icon = Icons.Default.SkipNext,
-                    description = "Forward 10s",
-                    onClick = onSeekForward
+                    description = "Next",
+                    onClick = onSkipToEnd
                 )
             }
 
@@ -113,20 +123,20 @@ fun PlayerOverlay(
                     .fillMaxWidth()
                     .padding(horizontal = 32.dp, vertical = 24.dp)
             ) {
-                // Time
+                // Seekable time + duration
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = formatTime(positionMs),
-                        style = MaterialTheme.typography.labelLarge,
-                        color = Color.White
+                    SeekableTime(
+                        positionMs = pendingSeekMs,
+                        onAdjustMinute = onAdjustMinute
                     )
                     Text(
                         text = formatTime(durationMs),
                         style = MaterialTheme.typography.labelLarge,
-                        color = Color.White.copy(alpha = 0.7f)
+                        color = Color.White
                     )
                 }
 
@@ -135,10 +145,10 @@ fun PlayerOverlay(
                 // Progress bar
                 if (durationMs > 0) {
                     LinearProgressIndicator(
-                        progress = { (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) },
-                        modifier = Modifier.fillMaxWidth().height(4.dp),
+                        progress = { (pendingSeekMs.toFloat() / durationMs).coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth().height(6.dp),
                         color = Accent,
-                        trackColor = Color.White.copy(alpha = 0.3f)
+                        trackColor = Color.White.copy(alpha = 0.5f)
                     )
                 }
 
@@ -156,8 +166,15 @@ fun PlayerOverlay(
                         }
                     }
 
-                    if (hasSubtitles) {
+                    if (subtitleTracks.isNotEmpty()) {
                         Spacer(Modifier.width(16.dp))
+                        subtitleTracks.forEachIndexed { index, track ->
+                            TrackChip(
+                                text = track,
+                                isSelected = index == selectedSubtitleTrack,
+                                onClick = { onSelectSubtitle(index) }
+                            )
+                        }
                         TrackChip(
                             text = "Без субтитров",
                             isSelected = selectedSubtitleTrack < 0,
@@ -175,18 +192,23 @@ private fun OverlayButton(
     icon: ImageVector,
     description: String,
     onClick: () -> Unit,
-    size: androidx.compose.ui.unit.Dp = 48.dp
+    size: Dp = 48.dp,
+    focusRequester: FocusRequester? = null
 ) {
     var isFocused by remember { mutableStateOf(false) }
+    var modifier = Modifier
+        .size(size)
+        .onFocusChanged { isFocused = it.isFocused }
+        .background(
+            if (isFocused) Accent.copy(alpha = 0.3f) else Color.Transparent,
+            RoundedCornerShape(size / 2)
+        )
+    if (focusRequester != null) {
+        modifier = modifier.focusRequester(focusRequester)
+    }
     IconButton(
         onClick = onClick,
-        modifier = Modifier
-            .size(size)
-            .onFocusChanged { isFocused = it.isFocused }
-            .background(
-                if (isFocused) Accent.copy(alpha = 0.3f) else Color.Transparent,
-                RoundedCornerShape(size / 2)
-            )
+        modifier = modifier
     ) {
         Icon(
             imageVector = icon,
@@ -207,7 +229,7 @@ private fun TrackChip(text: String, isSelected: Boolean, onClick: () -> Unit) {
                 when {
                     isSelected -> Accent
                     isFocused -> SurfaceVariant
-                    else -> Color.White.copy(alpha = 0.15f)
+                    else -> Color.White.copy(alpha = 0.18f)
                 }
             )
             .border(
@@ -215,15 +237,66 @@ private fun TrackChip(text: String, isSelected: Boolean, onClick: () -> Unit) {
                 color = Accent,
                 shape = RoundedCornerShape(16.dp)
             )
-            .clickable { onClick() }
             .onFocusChanged { isFocused = it.isFocused }
+            .clickable { onClick() }
             .padding(horizontal = 14.dp, vertical = 6.dp)
     ) {
         Text(
             text = text,
             style = MaterialTheme.typography.labelLarge,
-            color = if (isSelected) Color.White else Color.White.copy(alpha = 0.8f)
+            color = if (isSelected) Color.White else Color.White
         )
+    }
+}
+
+@Composable
+private fun SeekableTime(
+    positionMs: Long,
+    onAdjustMinute: (Int) -> Unit
+) {
+    var isFocused by remember { mutableStateOf(false) }
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(
+                if (isFocused) SurfaceVariant else Color.Transparent
+            )
+            .border(
+                width = if (isFocused) 1.dp else 0.dp,
+                color = Accent,
+                shape = RoundedCornerShape(8.dp)
+            )
+            .onFocusChanged { isFocused = it.isFocused }
+            .onPreviewKeyEvent { event ->
+                if (event.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
+                when (event.nativeKeyEvent.keyCode) {
+                    KeyEvent.KEYCODE_DPAD_LEFT -> {
+                        onAdjustMinute(-1)
+                        true
+                    }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                        onAdjustMinute(1)
+                        true
+                    }
+                    else -> false
+                }
+            }
+            .focusable()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (isFocused) {
+                Text("◀ ", style = MaterialTheme.typography.labelLarge, color = Accent)
+            }
+            Text(
+                text = formatTime(positionMs),
+                style = MaterialTheme.typography.labelLarge,
+                color = if (isFocused) Accent else Color.White
+            )
+            if (isFocused) {
+                Text(" ▶", style = MaterialTheme.typography.labelLarge, color = Accent)
+            }
+        }
     }
 }
 

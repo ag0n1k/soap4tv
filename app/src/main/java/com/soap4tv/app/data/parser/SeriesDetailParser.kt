@@ -1,11 +1,14 @@
 package com.soap4tv.app.data.parser
 
+import android.util.Log
 import com.soap4tv.app.data.model.Season
 import com.soap4tv.app.data.model.SeriesDetail
 import com.soap4tv.app.data.network.SoapApiClient
 import org.jsoup.Jsoup
 
 object SeriesDetailParser {
+
+    private const val TAG = "SeriesDetailParser"
 
     fun parseSeriesDetail(html: String, slug: String): SeriesDetail {
         val doc = Jsoup.parse(html)
@@ -91,10 +94,17 @@ object SeriesDetailParser {
     }
 
     private fun extractSeriesId(html: String, slug: String): Int {
-        // Try to extract from page HTML - look for soap-{id} pattern or API URLs
-        val idRegex = Regex("""api/v2/soap/(?:watch|unwatch)/(\d+)""")
-        idRegex.find(html)?.let { return it.groupValues[1].toIntOrNull() ?: 0 }
-        // Fallback: hash the slug
-        return slug.hashCode().and(0x7FFFFFFF)
+        // Try watch/unwatch API URL first.
+        val watchRegex = Regex("""api/v2/soap/(?:watch|unwatch)/(\d+)""")
+        watchRegex.find(html)?.let { return it.groupValues[1].toIntOrNull() ?: 0 }
+
+        // Fall back to `soap-<id>` anchors/ids on the page.
+        val soapIdRegex = Regex("""soap-(\d+)""")
+        soapIdRegex.find(html)?.let { return it.groupValues[1].toIntOrNull() ?: 0 }
+
+        // Last resort — return 0 instead of slug.hashCode(), which created a
+        // fake numeric id that polluted caches and broke API calls silently.
+        Log.w(TAG, "Could not extract series id for slug=$slug; returning 0")
+        return 0
     }
 }

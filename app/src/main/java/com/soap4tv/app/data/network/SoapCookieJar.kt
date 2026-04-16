@@ -1,18 +1,21 @@
 package com.soap4tv.app.data.network
 
-import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
-import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -26,70 +29,73 @@ class SoapCookieJar @Inject constructor(
         private const val TARGET_DOMAIN = "soap4youand.me"
     }
 
-    // In-memory cache for performance
-    private var cookieCache: MutableList<Cookie> = mutableListOf()
-    private var cacheLoaded = false
+    // Singleton-scoped, app-lifetime coroutine for async persistence.
+    private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // Thread-safe in-memory store keyed by cookie name.
+    private val cookieCache = ConcurrentHashMap<String, Cookie>()
+
+    // Initial load happens synchronously once — this is acceptable at process start,
+    // before any network call; afterwards all CookieJar methods are non-blocking.
+    @Volatile
+    private var loaded = false
+    private val loadLock = Any()
+
+    private fun ensureLoaded() {
+        if (loaded) return
+        synchronized(loadLock) {
+            if (loaded) return
+            val stored = runBlocking {
+                dataStore.data.first()[COOKIES_KEY] ?: ""
+            }
+            val plaintext = if (stored.isBlank()) "" else CookieCrypto.decrypt(stored) ?: ""
+            if (plaintext.isNotBlank()) {
+                deserializeCookies(plaintext).forEach { cookieCache[it.name] = it }
+            }
+            loaded = true
+        }
+    }
 
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
         if (!url.host.contains(TARGET_DOMAIN)) return
         if (cookies.isEmpty()) return
+        ensureLoaded()
 
-        // Update in-memory cache
-        val newNames = cookies.map { it.name }.toSet()
-        cookieCache.removeAll { it.name in newNames }
-        cookieCache.addAll(cookies)
-
-        // Persist to DataStore
-        runBlocking {
-            dataStore.edit { prefs ->
-                prefs[COOKIES_KEY] = serializeCookies(cookieCache)
-            }
-        }
+        cookies.forEach { cookieCache[it.name] = it }
+        persistAsync()
     }
 
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
         if (!url.host.contains(TARGET_DOMAIN)) return emptyList()
+        ensureLoaded()
 
-        // Load from DataStore on first access
-        if (!cacheLoaded) {
-            runBlocking {
-                val prefs = dataStore.data.first()
-                val serialized = prefs[COOKIES_KEY] ?: ""
-                if (serialized.isNotBlank()) {
-                    cookieCache = deserializeCookies(serialized).toMutableList()
-                }
-            }
-            cacheLoaded = true
-        }
-
-        // Filter out expired cookies
         val now = System.currentTimeMillis()
-        return cookieCache.filter { cookie ->
-            cookie.expiresAt > now || cookie.persistent.not()
+        return cookieCache.values.filter { cookie ->
+            cookie.expiresAt > now || !cookie.persistent
         }
     }
 
     fun clearCookies() {
         cookieCache.clear()
-        runBlocking {
-            dataStore.edit { prefs ->
-                prefs.remove(COOKIES_KEY)
-            }
+        loaded = true
+        persistenceScope.launch {
+            dataStore.edit { prefs -> prefs.remove(COOKIES_KEY) }
         }
     }
 
     fun hasCookies(): Boolean {
-        if (!cacheLoaded) {
-            runBlocking {
-                val prefs = dataStore.data.first()
-                val serialized = prefs[COOKIES_KEY] ?: ""
-                if (serialized.isNotBlank()) {
-                    cookieCache = deserializeCookies(serialized).toMutableList()
-                }
+        ensureLoaded()
+        return cookieCache.containsKey("PHPSESSID")
+    }
+
+    private fun persistAsync() {
+        val snapshot = cookieCache.values.toList()
+        persistenceScope.launch {
+            val encrypted = CookieCrypto.encrypt(serializeCookies(snapshot))
+            dataStore.edit { prefs ->
+                prefs[COOKIES_KEY] = encrypted
             }
-            cacheLoaded = true
         }
-        return cookieCache.any { it.name == "PHPSESSID" }
     }
 
     private fun serializeCookies(cookies: List<Cookie>): String {
@@ -128,8 +134,8 @@ class SoapCookieJar @Inject constructor(
                     .build()
                 result.add(cookie)
             }
-        } catch (e: Exception) {
-            // Return empty on parse error — user will need to re-login
+        } catch (_: Exception) {
+            // Corrupt store — user re-logs in.
         }
         return result
     }

@@ -4,16 +4,6 @@ import com.soap4tv.app.data.model.Episode
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
-/**
- * Helper: try colon-style attr first (data:foo), then hyphen-style (data-foo).
- * The site uses non-standard `data:attr` syntax; Jsoup may handle it differently across versions.
- */
-private fun Element.dataAttr(name: String): String {
-    val colon = attr("data:$name")
-    if (colon.isNotBlank()) return colon
-    return attr("data-$name")
-}
-
 object EpisodeListParser {
 
     /**
@@ -25,12 +15,8 @@ object EpisodeListParser {
         val seasonTitle = doc.selectFirst(".episodes-season-badge")?.text() ?: ""
         val cards = doc.select(".episode-card")
 
-        val episodes = cards.mapNotNull { card ->
-            try {
-                parseEpisodeCard(card)
-            } catch (e: Exception) {
-                null
-            }
+        val episodes = cards.mapNotNullLogging("parseEpisodes") { card ->
+            parseEpisodeCard(card)
         }
         return seasonTitle to episodes
     }
@@ -46,7 +32,10 @@ object EpisodeListParser {
         val eid = playEl?.dataAttr("eid")?.takeIf { it.isNotBlank() }
         val sid = playEl?.dataAttr("sid")?.takeIf { it.isNotBlank() }
         val hash = playEl?.dataAttr("hash")?.takeIf { it.isNotBlank() }
-        val canPlay = playEl != null && (playEl.hasAttr("data:play") || playEl.hasAttr("data-play"))
+        // canPlay requires not just the play-marker attr but also a usable hash —
+        // otherwise the Play API call will fail when the user hits Play.
+        val hasPlayMarker = playEl != null && (playEl.hasAttr("data:play") || playEl.hasAttr("data-play"))
+        val canPlay = hasPlayMarker && !hash.isNullOrBlank() && !eid.isNullOrBlank() && !sid.isNullOrBlank()
 
         // Watch status: .episode-watched > div (class "yes" = watched)
         val watchedDiv = card.selectFirst(".episode-watched > div")
