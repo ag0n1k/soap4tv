@@ -64,7 +64,8 @@ class SeriesRepository @Inject constructor(
         ).map { }
     }
 
-    suspend fun markEpisodeWatched(eid: Int, token: String, watched: Boolean): Result<Unit> {
+    suspend fun markEpisodeWatched(eid: Int, watched: Boolean): Result<Unit> {
+        val token = authRepository.getToken() ?: return Result.failure(Exception("Not authenticated"))
         val what = if (watched) "mark_watched" else "mark_unwatched"
         return apiClient.callbackPost(
             params = mapOf(

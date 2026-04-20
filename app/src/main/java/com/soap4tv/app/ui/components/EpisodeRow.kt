@@ -24,9 +24,11 @@ import com.soap4tv.app.ui.theme.*
 fun EpisodeRow(
     episode: Episode,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isLocallyWatched: Boolean = false
 ) {
     var isFocused by remember { mutableStateOf(false) }
+    val watched = episode.isWatched || isLocallyWatched
 
     Row(
         modifier = modifier
@@ -35,7 +37,7 @@ fun EpisodeRow(
             .background(
                 when {
                     isFocused -> SurfaceVariant
-                    episode.isWatched -> Surface.copy(alpha = 0.5f)
+                    watched -> Surface.copy(alpha = 0.5f)
                     else -> Color.Transparent
                 }
             )
@@ -60,9 +62,9 @@ fun EpisodeRow(
 
         // Watched indicator
         Icon(
-            imageVector = if (episode.isWatched) Icons.Default.Check else Icons.Default.PlayArrow,
-            contentDescription = if (episode.isWatched) "Watched" else "Not watched",
-            tint = if (episode.isWatched) WatchedGreen
+            imageVector = if (watched) Icons.Default.Check else Icons.Default.PlayArrow,
+            contentDescription = if (watched) "Watched" else "Not watched",
+            tint = if (watched) WatchedGreen
                 else if (isFocused) Accent
                 else TextSecondary.copy(alpha = 0.3f),
             modifier = Modifier.size(20.dp)
@@ -74,7 +76,7 @@ fun EpisodeRow(
             Text(
                 text = displayTitle,
                 style = MaterialTheme.typography.bodyLarge,
-                color = if (isFocused) OnBackground else if (episode.isWatched) TextSecondary else OnSurface,
+                color = if (isFocused) OnBackground else if (watched) TextSecondary else OnSurface,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )

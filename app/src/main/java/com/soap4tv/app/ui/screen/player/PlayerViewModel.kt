@@ -8,6 +8,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.soap4tv.app.data.model.Episode
 import com.soap4tv.app.data.model.PlaybackData
+import com.soap4tv.app.data.network.PlayerHttp
 import com.soap4tv.app.data.repository.CatalogRepository
 import com.soap4tv.app.data.repository.MovieRepository
 import com.soap4tv.app.data.repository.PlayerRepository
@@ -24,7 +25,7 @@ class PlayerViewModel @Inject constructor(
     private val catalogRepository: CatalogRepository,
     private val seriesRepository: SeriesRepository,
     private val watchProgressRepository: WatchProgressRepository,
-    val okHttpClient: okhttp3.OkHttpClient,
+    @PlayerHttp val okHttpClient: okhttp3.OkHttpClient,
     savedStateHandle: SavedStateHandle
 ) : ViewModel() {
 
@@ -42,6 +43,10 @@ class PlayerViewModel @Inject constructor(
     private var seasonNumber: Int = 0
     private var episodeNumber: Int = 0
     private var seriesTitle: String = ""
+    private var currentSlug: String? = null
+    // Set to true once we've pushed mark_watched to the server for the current episode,
+    // so we don't hammer /callback/ every save tick after the 90% threshold.
+    private var markedWatched: Boolean = false
 
     // Episode list for autoplay
     private var episodeList: List<Episode> = emptyList()
@@ -60,6 +65,8 @@ class PlayerViewModel @Inject constructor(
 
         when {
             eid != null && sid != null && hash != null -> {
+                currentSlug = slug
+                seasonNumber = season ?: 0
                 loadSeriesEpisode(eid, sid, hash)
                 if (slug != null && season != null) {
                     loadEpisodeList(slug, season, eid)
@@ -150,6 +157,7 @@ class PlayerViewModel @Inject constructor(
         val sid = next.sid ?: return
         val hash = next.hash ?: return
         currentEpisodeEid = eid
+        markedWatched = false
         updateHasNext()
         loadSeriesEpisode(eid, sid, hash)
     }
@@ -173,6 +181,17 @@ class PlayerViewModel @Inject constructor(
                 positionMs = positionMs,
                 durationMs = durationMs
             )
+
+            // Once the episode crosses 90% (matching the site's own watched threshold),
+            // tell the server and drop our cached episode list so the watched badge
+            // shows up when the user returns to the episode list.
+            if (contentType == "series" && !markedWatched &&
+                durationMs > 0 && positionMs.toDouble() / durationMs > 0.9 && episodeId > 0
+            ) {
+                markedWatched = true
+                seriesRepository.markEpisodeWatched(episodeId, watched = true)
+                currentSlug?.let { seriesRepository.invalidateCache(slug = it) }
+            }
         }
     }
 }

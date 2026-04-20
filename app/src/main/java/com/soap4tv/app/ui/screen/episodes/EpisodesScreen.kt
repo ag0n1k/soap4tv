@@ -14,6 +14,9 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.soap4tv.app.ui.components.EpisodeRow
 import com.soap4tv.app.ui.components.FilterChipRow
 import com.soap4tv.app.ui.components.FilterOption
@@ -30,6 +33,20 @@ fun EpisodesScreen(
     viewModel: EpisodesViewModel = hiltViewModel()
 ) {
     LaunchedEffect(slug, season) { viewModel.load(slug, season) }
+
+    // Force-refresh the episode list when the user returns to this screen (e.g. from
+    // the player). The site may now flag the just-watched episode as watched server-side,
+    // and our local DB knows about any >90% completions.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, slug, season) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.load(slug, season, forceRefresh = true)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     Column(
         modifier = Modifier
@@ -132,6 +149,7 @@ fun EpisodesScreen(
                     items(viewModel.episodes, key = { it.id }) { episode ->
                         EpisodeRow(
                             episode = episode,
+                            isLocallyWatched = viewModel.locallyWatchedIds.contains(episode.id),
                             onClick = {
                                 if (episode.canPlay && episode.eid != null &&
                                     episode.sid != null && episode.hash != null
