@@ -67,7 +67,10 @@ fun AppNavigation(authState: AuthState) {
             HomeScreen(
                 onSeriesClick = { slug -> navController.navigate(Routes.seriesDetail(slug)) },
                 onMovieClick = { id -> navController.navigate(Routes.movieDetail(id)) },
-                onSearchClick = { navController.navigate(Routes.SEARCH) }
+                onSearchClick = { navController.navigate(Routes.SEARCH) },
+                onEpisodesClick = { slug, season ->
+                    navController.navigate(Routes.episodes(slug, season))
+                }
             )
         }
 

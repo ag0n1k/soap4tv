@@ -4,6 +4,7 @@ import android.app.Application
 import coil3.ImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import com.soap4tv.app.data.network.PlayerHttp
+import com.soap4tv.app.data.network.PlayerHttpEventListener
 import com.soap4tv.app.data.network.RetryInterceptor
 import com.soap4tv.app.data.network.SoapCookieJar
 import dagger.Module
@@ -47,6 +48,7 @@ object NetworkModule {
             .writeTimeout(15, TimeUnit.SECONDS)
             .followRedirects(true)
             .addInterceptor(RetryInterceptor())
+            .eventListenerFactory { PlayerHttpEventListener() }
             .build()
 
     @Provides

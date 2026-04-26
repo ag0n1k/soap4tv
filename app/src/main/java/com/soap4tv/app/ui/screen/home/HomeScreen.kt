@@ -33,6 +33,7 @@ fun HomeScreen(
     onSeriesClick: (String) -> Unit,
     onMovieClick: (Int) -> Unit,
     onSearchClick: () -> Unit,
+    onEpisodesClick: (slug: String, season: Int) -> Unit,
     homeViewModel: HomeViewModel = hiltViewModel(),
     catalogViewModel: CatalogViewModel = hiltViewModel()
 ) {
@@ -100,7 +101,8 @@ fun HomeScreen(
                 homeViewModel = homeViewModel,
                 catalogViewModel = catalogViewModel,
                 onSeriesClick = onSeriesClick,
-                onMovieClick = onMovieClick
+                onMovieClick = onMovieClick,
+                onEpisodesClick = onEpisodesClick
             )
         }
     }

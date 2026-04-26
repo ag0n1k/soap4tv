@@ -30,7 +30,8 @@ fun MyContentScreen(
     homeViewModel: HomeViewModel,
     catalogViewModel: CatalogViewModel,
     onSeriesClick: (String) -> Unit,
-    onMovieClick: (Int) -> Unit
+    onMovieClick: (Int) -> Unit,
+    onEpisodesClick: (slug: String, season: Int) -> Unit
 ) {
     val localHistory by homeViewModel.continueWatching.collectAsStateWithLifecycle()
     val continueWatching by catalogViewModel.continueWatchingServer.collectAsStateWithLifecycle()
@@ -62,8 +63,12 @@ fun MyContentScreen(
                 ContinueWatchingRow(
                     items = localHistory,
                     onItemClick = { item ->
-                        if (item.contentType == "series") onSeriesClick(item.contentId)
-                        else onMovieClick(item.contentId.toIntOrNull() ?: 0)
+                        if (item.contentType == "series") {
+                            // Jump straight into the episode list for the last-watched
+                            // season. Cheap — we already have slug + seasonNumber in the
+                            // watch progress row; no extra network call needed.
+                            onEpisodesClick(item.contentId, item.seasonNumber)
+                        } else onMovieClick(item.contentId.toIntOrNull() ?: 0)
                     }
                 )
                 Spacer(Modifier.height(8.dp))
@@ -83,7 +88,7 @@ fun MyContentScreen(
                     items(continueWatching) { item ->
                         ContinueWatchingServerCard(
                             item = item,
-                            onClick = { onSeriesClick(item.slug) }
+                            onClick = { onEpisodesClick(item.slug, item.season) }
                         )
                     }
                 }

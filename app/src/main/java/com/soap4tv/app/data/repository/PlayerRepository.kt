@@ -97,7 +97,8 @@ class PlayerRepository @Inject constructor(
             posterUrl = if (posterUrl.startsWith("http")) posterUrl
                 else "${SoapApiClient.BASE_URL}$posterUrl",
             title = title,
-            startFrom = startFrom
+            startFrom = startFrom,
+            episodeId = eid.toIntOrNull() ?: 0
         )
     }
 

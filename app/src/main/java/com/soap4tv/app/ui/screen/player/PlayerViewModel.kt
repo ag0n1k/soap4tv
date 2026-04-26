@@ -15,6 +15,9 @@ import com.soap4tv.app.data.repository.PlayerRepository
 import com.soap4tv.app.data.repository.SeriesRepository
 import com.soap4tv.app.data.repository.WatchProgressRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -44,6 +47,23 @@ class PlayerViewModel @Inject constructor(
     private var episodeNumber: Int = 0
     private var seriesTitle: String = ""
     private var currentSlug: String? = null
+    // Original play-API params for the current series episode — kept so we can
+    // refetch a fresh stream URL mid-playback when the CDN session goes stale
+    // (the user's "просмотр обновился" pattern: pre-buffered URL stops responding,
+    // exiting + re-entering returns a working URL).
+    private var currentEid: String = ""
+    private var currentSid: String = ""
+    private var currentHash: String = ""
+    // Cool-down so a player stuck on a bad refresh doesn't trigger a tight refresh
+    // loop. Reset on every loadSeriesEpisode (new episode = fresh budget).
+    private var lastRefreshAtMs: Long = 0L
+
+    // Refresh stream event channel: emitting (newStreamUrl, startSec) lets PlayerScreen
+    // call setMediaItem on the EXISTING ExoPlayer instead of rebuilding it. Rebuilding
+    // would tear down the PlayerView's surface attachment, leaving audio playing while
+    // video frames render to nowhere.
+    private val _refreshStreamEvents = MutableSharedFlow<Pair<String, Long>>(extraBufferCapacity = 1)
+    val refreshStreamEvents: SharedFlow<Pair<String, Long>> = _refreshStreamEvents.asSharedFlow()
     // Set to true once we've pushed mark_watched to the server for the current episode,
     // so we don't hammer /callback/ every save tick after the 90% threshold.
     private var markedWatched: Boolean = false
@@ -84,6 +104,10 @@ class PlayerViewModel @Inject constructor(
         episodeId = eid.toIntOrNull() ?: 0
         contentType = "series"
         contentId = sid // fallback, will be replaced by slug below
+        currentEid = eid
+        currentSid = sid
+        currentHash = hash
+        lastRefreshAtMs = 0L
         // Look up series slug + name from cached catalog by series ID
         viewModelScope.launch {
             val sidInt = sid.toIntOrNull()
@@ -125,7 +149,8 @@ class PlayerViewModel @Inject constructor(
                         subtitles = detail.subtitles,
                         posterUrl = detail.posterUrl,
                         title = detail.title,
-                        startFrom = 0L
+                        startFrom = 0L,
+                        episodeId = -movieId
                     )
                 }
                 .onFailure { error = it.message }
@@ -149,6 +174,35 @@ class PlayerViewModel @Inject constructor(
         hasNextEpisode = idx >= 0 && idx < episodeList.size - 1
     }
 
+    /**
+     * Re-fetch the stream URL for the current series episode and resume from the given
+     * position. Used by the player's stall watchdog when the CDN session goes stale —
+     * exiting and re-entering the episode also fixes it, but this avoids the manual step.
+     * No-op for movies (movies have a single fetch on entry; if this becomes an issue
+     * for movies, mirror the pattern by storing the movie id and calling getMovieDetail).
+     */
+    fun refreshStream(currentPositionMs: Long) {
+        val eid = currentEid
+        val sid = currentSid
+        val hash = currentHash
+        if (eid.isEmpty() || sid.isEmpty() || hash.isEmpty()) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastRefreshAtMs < 30_000L) return
+        lastRefreshAtMs = now
+        val resumeSec = (currentPositionMs / 1000).coerceAtLeast(0)
+        viewModelScope.launch {
+            // Emit a refresh event so the player screen can call setMediaItem on the
+            // EXISTING player instead of rebuilding it (which would detach PlayerView's
+            // surface and leave video frames going nowhere — audio + subs would still
+            // work because they don't need that surface).
+            playerRepository.getSeriesPlaybackData(eid, sid, hash)
+                .onSuccess { fresh ->
+                    _refreshStreamEvents.tryEmit(fresh.streamUrl to resumeSec)
+                }
+                .onFailure { error = it.message }
+        }
+    }
+
     fun playNextEpisode() {
         val idx = episodeList.indexOfFirst { it.eid == currentEpisodeEid }
         if (idx < 0 || idx >= episodeList.size - 1) return
@@ -165,12 +219,20 @@ class PlayerViewModel @Inject constructor(
     fun saveProgress(
         positionMs: Long,
         durationMs: Long,
-        coverUrl: String = ""
+        coverUrl: String = "",
+        snapshot: PlaybackData? = null
     ) {
-        val data = playbackData ?: return
+        // Use the explicit snapshot when provided (dispose-time saves of an OLD player
+        // after autoplay has already mutated ViewModel state for the next episode);
+        // otherwise fall back to the current playbackData.
+        val data = snapshot ?: playbackData ?: return
+        val snapEpisodeId = data.episodeId.takeIf { it != 0 } ?: episodeId
+        // Cache the slug locally so the coroutine can't read a value that has been
+        // changed by the autoplay path between launch and execution.
+        val snapSlug = currentSlug
         viewModelScope.launch {
             watchProgressRepository.saveProgress(
-                episodeId = episodeId,
+                episodeId = snapEpisodeId,
                 contentType = contentType,
                 contentId = contentId,
                 seasonNumber = seasonNumber,
@@ -186,11 +248,16 @@ class PlayerViewModel @Inject constructor(
             // tell the server and drop our cached episode list so the watched badge
             // shows up when the user returns to the episode list.
             if (contentType == "series" && !markedWatched &&
-                durationMs > 0 && positionMs.toDouble() / durationMs > 0.9 && episodeId > 0
+                durationMs > 0 && positionMs.toDouble() / durationMs > 0.9 && snapEpisodeId > 0
             ) {
-                markedWatched = true
-                seriesRepository.markEpisodeWatched(episodeId, watched = true)
-                currentSlug?.let { seriesRepository.invalidateCache(slug = it) }
+                // Only commit the markedWatched flag if the snapshot still matches the
+                // current episode — otherwise we'd block the NEXT episode (which now
+                // owns episodeId) from ever being marked when its own threshold hits.
+                if (snapEpisodeId == episodeId) {
+                    markedWatched = true
+                }
+                seriesRepository.markEpisodeWatched(snapEpisodeId, watched = true)
+                snapSlug?.let { seriesRepository.invalidateCache(slug = it) }
             }
         }
     }

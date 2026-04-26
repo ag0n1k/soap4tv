@@ -37,8 +37,12 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.PlayerView
+import com.soap4tv.app.data.network.PlayerHttpSnapshot
+import com.soap4tv.app.data.network.PlayerHttpStats
 import com.soap4tv.app.ui.components.LoadingIndicator
 import com.soap4tv.app.ui.theme.OnSurface
 import kotlinx.coroutines.delay
@@ -70,7 +74,28 @@ fun PlayerScreen(
     var userAdjustedSeek by remember { mutableStateOf(false) }
     var showDebug by remember { mutableStateOf(false) }
     var debugStats by remember { mutableStateOf(DebugStats()) }
+    var bufferStartMs by remember { mutableStateOf(0L) }
+    // Per-stall escalation flags, reset on STATE_READY so a fresh stall starts the
+    // ladder again. seekTo at 30 s → refreshStream at 60 s.
+    var stallSeekAttempted by remember { mutableStateOf(false) }
+    var stallRefreshAttempted by remember { mutableStateOf(false) }
+    // Burst-error refresh: if we get >=2 load errors within 10 s, the CDN session
+    // is almost certainly stale (server returns HTML / 200 instead of 206 with the
+    // requested bytes, parser sees garbage as "invalid NAL length"). Fire refresh
+    // immediately rather than waiting for the 60 s stall watchdog.
+    var lastLoadErrorMs by remember { mutableStateOf(0L) }
+    var consecutiveLoadErrors by remember { mutableStateOf(0) }
+    // Video-only stall: audio + subtitles keep playing (state=READY, isPlaying=true)
+    // but the video decoder is stuck on a bad frame from earlier malformed bytes.
+    // STATE_BUFFERING never fires, so the network watchdog doesn't help. The frame
+    // timestamp is updated 24+ times per second by setVideoFrameMetadataListener,
+    // so it MUST be a non-Compose value (AtomicLong) to avoid triggering recomposition
+    // on every frame; the watchdog tick reads it periodically.
+    val lastVideoFrameMsRef = remember { java.util.concurrent.atomic.AtomicLong(0L) }
+    var videoStallSeekDone by remember { mutableStateOf(false) }
+    var videoStallRefreshDone by remember { mutableStateOf(false) }
     var currentCueText by remember { mutableStateOf("") }
+    val httpSnapshot by PlayerHttpStats.flow.collectAsState()
     val scope = rememberCoroutineScope()
     var hideOverlayJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     val playerFocusRequester = remember { FocusRequester() }
@@ -100,28 +125,46 @@ fun PlayerScreen(
         if (playbackData == null) return@remember null
 
         val dataSourceFactory = OkHttpDataSource.Factory(viewModel.okHttpClient)
-        // Keep auto-detection (HLS / MP4 / DASH) — some movies come through as direct MP4.
-        val mediaSourceFactory = DefaultMediaSourceFactory(context)
-            .setDataSourceFactory(dataSourceFactory)
+        // Series come back as direct progressive MP4 (single "stream" URL from /api/v2/play/episode);
+        // movies come back as HLS (.m3u8 from Playerjs JS). Branch on the URL so we can give each
+        // path its own factory and tune progressive specifically — DefaultMediaSourceFactory hides
+        // both the ProgressiveMediaSource and HlsMediaSource knobs.
+        val streamUrl = playbackData.streamUrl
+        val isHls = streamUrl.contains(".m3u8", ignoreCase = true)
+        val mediaSourceFactory: MediaSource.Factory = if (isHls) {
+            HlsMediaSource.Factory(dataSourceFactory)
+                .setAllowChunklessPreparation(true)
+        } else {
+            ProgressiveMediaSource.Factory(dataSourceFactory)
+                .setContinueLoadingCheckIntervalBytes(1024 * 1024)
+        }
 
-        // Buffer sizing tuned for 2GB-RAM Android TVs (e.g. TCL P7K): large enough to ride
-        // out short network dips, small enough to avoid system GC pressure at 4K bitrates.
-        // Hard byte cap at ~64MB stops a 25Mbps stream from filling 150MB+ of RAM.
+        // Buffer sizing tuned for progressive MP4 series on Wi-Fi: 60–120 s window absorbs router
+        // hiccups, byte cap raised to 128 MB so we don't pin the cap on multi-Mbps streams (which
+        // pauses fetch and lets idle TCP get reaped). Still ~6% of RAM on 2 GB TVs.
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 30_000,
-                /* maxBufferMs = */ 60_000,
-                /* bufferForPlaybackMs = */ 2_500,
-                /* bufferForPlaybackAfterRebufferMs = */ 5_000
+                /* minBufferMs = */ 60_000,
+                /* maxBufferMs = */ 120_000,
+                /* bufferForPlaybackMs = */ 5_000,
+                /* bufferForPlaybackAfterRebufferMs = */ 10_000
             )
-            .setTargetBufferBytes(64 * 1024 * 1024)
-            .setPrioritizeTimeOverSizeThresholds(false)
+            .setTargetBufferBytes(128 * 1024 * 1024)
+            .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
         val player = ExoPlayer.Builder(context)
             .setLoadControl(loadControl)
             .setMediaSourceFactory(mediaSourceFactory)
             .build()
+
+        // Per-frame timestamp for the video stall watchdog. Fired by Media3 right
+        // before each frame is sent to the surface — the most reliable "is the video
+        // decoder still alive?" signal. Runs on a renderer thread; AtomicLong write
+        // is safe and non-Compose so we don't trigger a recompose 24x/sec.
+        player.setVideoFrameMetadataListener { _, _, _, _ ->
+            lastVideoFrameMsRef.set(android.os.SystemClock.elapsedRealtime())
+        }
 
         // Seed the DefaultTrackSelector with the user's prior choices so Media3 picks
         // the right audio/subtitle track before playback starts — no visible flicker.
@@ -190,6 +233,66 @@ fun PlayerScreen(
                 ) {
                     debugStats = debugStats.copy(bandwidthKbps = bitrateEstimate / 1000)
                 }
+                override fun onLoadStarted(
+                    eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
+                    loadEventInfo: androidx.media3.exoplayer.source.LoadEventInfo,
+                    mediaLoadData: androidx.media3.exoplayer.source.MediaLoadData
+                ) {
+                    Log.d(
+                        "Soap4tvPlayer",
+                        "loadStart pos=${loadEventInfo.dataSpec.position} " +
+                            "len=${loadEventInfo.dataSpec.length} " +
+                            "uri=${loadEventInfo.dataSpec.uri}"
+                    )
+                }
+                override fun onLoadCompleted(
+                    eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
+                    loadEventInfo: androidx.media3.exoplayer.source.LoadEventInfo,
+                    mediaLoadData: androidx.media3.exoplayer.source.MediaLoadData
+                ) {
+                    val ms = loadEventInfo.loadDurationMs
+                    if (ms > 1_500) {
+                        Log.w(
+                            "Soap4tvPlayer",
+                            "loadCompleted SLOW ${ms}ms bytes=${loadEventInfo.bytesLoaded} " +
+                                "uri=${loadEventInfo.dataSpec.uri}"
+                        )
+                        debugStats = debugStats.copy(lastSlowLoadMs = ms)
+                    }
+                }
+                override fun onLoadError(
+                    eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
+                    loadEventInfo: androidx.media3.exoplayer.source.LoadEventInfo,
+                    mediaLoadData: androidx.media3.exoplayer.source.MediaLoadData,
+                    error: java.io.IOException,
+                    wasCanceled: Boolean
+                ) {
+                    Log.w(
+                        "Soap4tvPlayer",
+                        "loadError canceled=$wasCanceled err=${error.javaClass.simpleName}: ${error.message} " +
+                            "after ${loadEventInfo.loadDurationMs}ms uri=${loadEventInfo.dataSpec.uri}"
+                    )
+                    debugStats = debugStats.copy(
+                        lastLoadError = "${error.javaClass.simpleName}: ${error.message?.take(60).orEmpty()}"
+                    )
+                    if (wasCanceled) return
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    consecutiveLoadErrors = if (now - lastLoadErrorMs < 10_000L)
+                        consecutiveLoadErrors + 1 else 1
+                    lastLoadErrorMs = now
+                    if (consecutiveLoadErrors >= 2 && !stallRefreshAttempted) {
+                        stallRefreshAttempted = true
+                        val pos = player.currentPosition
+                        Log.w(
+                            "Soap4tvPlayer",
+                            "burst load errors ($consecutiveLoadErrors) — refreshStream($pos)"
+                        )
+                        debugStats = debugStats.copy(
+                            watchdogFires = debugStats.watchdogFires + 1
+                        )
+                        viewModel.refreshStream(pos)
+                    }
+                }
             })
 
             addListener(object : Player.Listener {
@@ -197,12 +300,54 @@ fun PlayerScreen(
                     isPlaying = playing
                 }
                 override fun onPlaybackStateChanged(state: Int) {
-                    if (state == Player.STATE_ENDED && viewModel.hasNextEpisode) {
-                        viewModel.playNextEpisode()
+                    when (state) {
+                        Player.STATE_BUFFERING -> {
+                            bufferStartMs = android.os.SystemClock.elapsedRealtime()
+                            val fmt = player.videoFormat
+                            Log.w(
+                                "Soap4tvPlayer",
+                                "STATE_BUFFERING enter pos=${player.currentPosition}ms " +
+                                    "bw=${debugStats.bandwidthKbps}kbps " +
+                                    "video=${fmt?.width}x${fmt?.height}@${(fmt?.bitrate ?: 0) / 1000}kbps"
+                            )
+                        }
+                        Player.STATE_READY -> {
+                            if (bufferStartMs > 0L) {
+                                val dur = android.os.SystemClock.elapsedRealtime() - bufferStartMs
+                                Log.w("Soap4tvPlayer", "STATE_BUFFERING exit after ${dur}ms")
+                                bufferStartMs = 0L
+                                debugStats = debugStats.copy(
+                                    lastStallMs = dur,
+                                    totalStalls = debugStats.totalStalls + 1
+                                )
+                            }
+                            stallSeekAttempted = false
+                            stallRefreshAttempted = false
+                            consecutiveLoadErrors = 0
+                            lastLoadErrorMs = 0L
+                        }
+                        Player.STATE_ENDED -> {
+                            if (viewModel.hasNextEpisode) viewModel.playNextEpisode()
+                        }
                     }
                 }
                 override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                     Log.e("Soap4tvPlayer", "error: ${error.errorCodeName} — ${error.message}", error)
+                    debugStats = debugStats.copy(
+                        lastLoadError = "${error.errorCodeName}: ${error.message?.take(60).orEmpty()}"
+                    )
+                    // Fatal player errors (often ParserException from a stale-session
+                    // response) leave the player in IDLE. Refresh the stream URL and
+                    // re-prepare so playback can resume from current position.
+                    if (!stallRefreshAttempted) {
+                        stallRefreshAttempted = true
+                        val pos = player.currentPosition
+                        Log.w("Soap4tvPlayer", "playerError — refreshStream($pos)")
+                        debugStats = debugStats.copy(
+                            watchdogFires = debugStats.watchdogFires + 1
+                        )
+                        viewModel.refreshStream(pos)
+                    }
                 }
                 // Capture cues in Compose state so we can render them in a small Box at
                 // the bottom instead of the full-screen PlayerView SubtitleView. This keeps
@@ -325,17 +470,118 @@ fun PlayerScreen(
             }
             if (showDebug) {
                 val bufferedMs = (player.bufferedPosition - player.currentPosition).coerceAtLeast(0)
-                debugStats = debugStats.copy(bufferedMs = bufferedMs)
+                val lastFrame = lastVideoFrameMsRef.get()
+                val frameAge = if (lastFrame > 0L)
+                    android.os.SystemClock.elapsedRealtime() - lastFrame else 0L
+                debugStats = debugStats.copy(
+                    bufferedMs = bufferedMs,
+                    videoFrameAgeMs = frameAge
+                )
+            }
+        }
+    }
+
+    // Video-only stall watchdog: audio/subtitles keep advancing while the picture is
+    // frozen — usually the video decoder choked on a bad NAL from a stale-session
+    // response earlier. STATE_BUFFERING never fires, so this runs independently of
+    // the network watchdog. seekTo flushes the video decoder; if frames still don't
+    // arrive after ~30 s total, escalate to a URL refresh.
+    LaunchedEffect(exoPlayer) {
+        val player = exoPlayer ?: return@LaunchedEffect
+        while (true) {
+            delay(2_000)
+            if (!player.isPlaying) continue
+            val last = lastVideoFrameMsRef.get()
+            if (last <= 0L) continue
+            val age = android.os.SystemClock.elapsedRealtime() - last
+            // Frames are arriving recently — decoder is healthy, reset the ladder
+            // so a future stall can escalate again from scratch.
+            if (age < 2_000L) {
+                videoStallSeekDone = false
+                videoStallRefreshDone = false
+                continue
+            }
+            when {
+                age > 30_000L && !videoStallRefreshDone -> {
+                    videoStallRefreshDone = true
+                    val pos = player.currentPosition
+                    Log.w(
+                        "Soap4tvPlayer",
+                        "video stall refresh after ${age}ms no frame — refreshStream($pos)"
+                    )
+                    debugStats = debugStats.copy(
+                        watchdogFires = debugStats.watchdogFires + 1
+                    )
+                    viewModel.refreshStream(pos)
+                }
+                age > 8_000L && !videoStallSeekDone -> {
+                    videoStallSeekDone = true
+                    val pos = player.currentPosition
+                    Log.w(
+                        "Soap4tvPlayer",
+                        "video stall seekTo after ${age}ms no frame — seekTo($pos)"
+                    )
+                    debugStats = debugStats.copy(
+                        watchdogFires = debugStats.watchdogFires + 1
+                    )
+                    player.seekTo(pos)
+                }
+            }
+        }
+    }
+
+    // Stall watchdog with two-step escalation: at 30 s a local seekTo (cheap, fixes a
+    // stuck local range), at 60 s a full URL refresh via the play API (fixes stale CDN
+    // sessions where the same URL stops responding — equivalent to the user exiting +
+    // re-entering the episode). Per-stall flags ensure each step fires once per stall.
+    LaunchedEffect(exoPlayer) {
+        val player = exoPlayer ?: return@LaunchedEffect
+        while (true) {
+            delay(5_000)
+            val started = bufferStartMs
+            if (started <= 0L) continue
+            val elapsed = android.os.SystemClock.elapsedRealtime() - started
+            when {
+                elapsed > 60_000L && !stallRefreshAttempted -> {
+                    stallRefreshAttempted = true
+                    val pos = player.currentPosition
+                    Log.w(
+                        "Soap4tvPlayer",
+                        "stall watchdog escalate after ${elapsed}ms — refreshStream($pos)"
+                    )
+                    debugStats = debugStats.copy(
+                        watchdogFires = debugStats.watchdogFires + 1
+                    )
+                    viewModel.refreshStream(pos)
+                }
+                elapsed > 30_000L && !stallSeekAttempted -> {
+                    stallSeekAttempted = true
+                    val pos = player.currentPosition
+                    Log.w(
+                        "Soap4tvPlayer",
+                        "stall watchdog fired after ${elapsed}ms — seekTo($pos)"
+                    )
+                    debugStats = debugStats.copy(
+                        watchdogFires = debugStats.watchdogFires + 1
+                    )
+                    player.seekTo(pos)
+                }
             }
         }
     }
 
     DisposableEffect(exoPlayer) {
+        // Freeze the current playbackData reference for this player's lifetime. When
+        // autoplay swaps in the next episode, the OLD player's onDispose still has the
+        // OLD playbackData (with its episodeId), so saveProgress credits the right
+        // episode rather than racing against the ViewModel's already-mutated episodeId.
+        val frozenData = playbackData
         onDispose {
             if (exoPlayer != null) {
                 viewModel.saveProgress(
                     positionMs = exoPlayer.currentPosition,
-                    durationMs = exoPlayer.duration.coerceAtLeast(0)
+                    durationMs = exoPlayer.duration.coerceAtLeast(0),
+                    snapshot = frozenData
                 )
                 exoPlayer.release()
             }
@@ -410,13 +656,15 @@ fun PlayerScreen(
     // so audio doesn't keep playing. Save progress at the same time.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, exoPlayer) {
+        val frozenData = playbackData
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> {
                     exoPlayer?.let { p ->
                         viewModel.saveProgress(
                             positionMs = p.currentPosition,
-                            durationMs = p.duration.coerceAtLeast(0)
+                            durationMs = p.duration.coerceAtLeast(0),
+                            snapshot = frozenData
                         )
                         p.playWhenReady = false
                     }
@@ -428,13 +676,59 @@ fun PlayerScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Reset state when a new episode starts (autoplay)
+    // Apply refreshStream events to the EXISTING player (no rebuild). Rebuilding the
+    // player would detach the PlayerView's surface and leave video frames going nowhere
+    // while audio and subtitles continue.
+    LaunchedEffect(exoPlayer) {
+        val player = exoPlayer ?: return@LaunchedEffect
+        viewModel.refreshStreamEvents.collect { (newUrl, startSec) ->
+            Log.w("Soap4tvPlayer", "refresh event: setting new media item, startSec=$startSec")
+            val data = viewModel.playbackData ?: return@collect
+            val subtitleConfigs = data.subtitles.map { sub ->
+                MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(sub.url))
+                    .setMimeType(MimeTypes.APPLICATION_SUBRIP)
+                    .setLanguage(sub.language)
+                    .setLabel(sub.label)
+                    .build()
+            }
+            val newItem = MediaItem.Builder()
+                .setUri(newUrl)
+                .setSubtitleConfigurations(subtitleConfigs)
+                .build()
+            player.setMediaItem(newItem)
+            if (startSec > 0) player.seekTo(startSec * 1000)
+            player.prepare()
+            player.playWhenReady = true
+            // Reset stall flags so the freshly refreshed player has its own ladder.
+            bufferStartMs = 0L
+            stallSeekAttempted = false
+            stallRefreshAttempted = false
+            consecutiveLoadErrors = 0
+            lastLoadErrorMs = 0L
+            lastVideoFrameMsRef.set(0L)
+            videoStallSeekDone = false
+            videoStallRefreshDone = false
+        }
+    }
+
+    // Reset state when a new episode starts (autoplay) or when refreshStream replaces
+    // the player. Crucially also resets the stall ladder flags so the new player has
+    // its own seekTo→refresh escalation; otherwise a stale `stallRefreshAttempted=true`
+    // from the previous player's stall would block ALL future watchdog actions.
     LaunchedEffect(playbackData) {
         showOverlay = false
         userAdjustedSeek = false
         positionMs = 0L
         pendingSeekMs = 0L
         currentCueText = ""
+        bufferStartMs = 0L
+        stallSeekAttempted = false
+        stallRefreshAttempted = false
+        consecutiveLoadErrors = 0
+        lastLoadErrorMs = 0L
+        lastVideoFrameMsRef.set(0L)
+        videoStallSeekDone = false
+        videoStallRefreshDone = false
     }
 
     // Prefetch subtitle files in the background so the first time the user enables a
@@ -701,9 +995,13 @@ fun PlayerScreen(
                 )
 
                 if (showDebug) {
-                    DebugStatsOverlay(stats = debugStats, modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(12.dp))
+                    DebugStatsOverlay(
+                        stats = debugStats,
+                        http = httpSnapshot,
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(12.dp)
+                    )
                 }
             }
         }
@@ -730,11 +1028,21 @@ data class DebugStats(
     val recentDropped: Int = 0,
     val bufferedMs: Long = 0L,
     val displayModes: String = "",
-    val requestedModeHz: Float = 0f
+    val requestedModeHz: Float = 0f,
+    val totalStalls: Int = 0,
+    val lastStallMs: Long = 0L,
+    val lastLoadError: String = "",
+    val lastSlowLoadMs: Long = 0L,
+    val watchdogFires: Int = 0,
+    val videoFrameAgeMs: Long = 0L
 )
 
 @Composable
-private fun DebugStatsOverlay(stats: DebugStats, modifier: Modifier = Modifier) {
+private fun DebugStatsOverlay(
+    stats: DebugStats,
+    http: PlayerHttpSnapshot,
+    modifier: Modifier = Modifier
+) {
     Box(
         modifier = modifier
             .background(Color.Black.copy(alpha = 0.75f))
@@ -742,12 +1050,27 @@ private fun DebugStatsOverlay(stats: DebugStats, modifier: Modifier = Modifier) 
     ) {
         val codecShort = stats.codec.substringAfterLast("/").ifBlank { "—" }
         val bufferedSec = stats.bufferedMs / 1000
+        val httpLenMb = if (http.lastContentLengthBytes > 0)
+            "%.1f".format(http.lastContentLengthBytes / 1_048_576.0) else "—"
         val text = buildString {
             appendLine("${stats.width}x${stats.height} @ ${"%.2f".format(stats.fps)} fps")
             appendLine("codec: $codecShort   stream: ${stats.bitrateKbps} kbps")
             appendLine("bandwidth: ${stats.bandwidthKbps} kbps")
             appendLine("buffered: ${bufferedSec}s")
             appendLine("dropped: total=${stats.totalDropped}, last=${stats.recentDropped}")
+            appendLine("stalls: total=${stats.totalStalls}, last=${stats.lastStallMs}ms, wd=${stats.watchdogFires}")
+            appendLine("video frame age: ${stats.videoFrameAgeMs}ms")
+            if (stats.lastSlowLoadMs > 0L) {
+                appendLine("slow load: ${stats.lastSlowLoadMs}ms")
+            }
+            if (stats.lastLoadError.isNotEmpty()) {
+                appendLine("load err: ${stats.lastLoadError}")
+            }
+            appendLine("http: calls=${http.totalCalls}, conn=${http.totalConnects}, err=${http.totalErrors}")
+            appendLine("last: code=${http.lastResponseCode} ttfb=${http.lastTtfbMs}ms ${httpLenMb}MB conn=${http.lastConnHeader}")
+            if (http.lastErrorClass.isNotEmpty()) {
+                appendLine("net err: ${http.lastErrorClass}: ${http.lastErrorMessage.take(50)}")
+            }
             appendLine("panel modes: ${stats.displayModes.ifBlank { "—" }} Hz")
             append("requested: ${"%.2f".format(stats.requestedModeHz)} Hz")
         }
