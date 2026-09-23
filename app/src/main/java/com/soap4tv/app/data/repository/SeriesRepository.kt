@@ -5,6 +5,7 @@ import com.soap4tv.app.data.model.SeriesDetail
 import com.soap4tv.app.data.network.SoapApiClient
 import com.soap4tv.app.data.parser.EpisodeListParser
 import com.soap4tv.app.data.parser.SeriesDetailParser
+import com.soap4tv.app.data.parser.parseOnWorker
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
@@ -29,7 +30,7 @@ class SeriesRepository @Inject constructor(
             if (!forceRefresh) {
                 detailCache[slug]?.let { return@withLock Result.success(it) }
             }
-            apiClient.fetchPage("/soap/$slug/").map { html ->
+            apiClient.fetchPage("/soap/$slug/").parseOnWorker { html ->
                 SeriesDetailParser.parseSeriesDetail(html, slug).also { detailCache[slug] = it }
             }
         }
@@ -48,7 +49,7 @@ class SeriesRepository @Inject constructor(
             if (!forceRefresh) {
                 episodeCache[key]?.let { return@withLock Result.success(it) }
             }
-            apiClient.fetchPage("/soap/$slug/$season/").map { html ->
+            apiClient.fetchPage("/soap/$slug/$season/").parseOnWorker { html ->
                 val (_, episodes) = EpisodeListParser.parseEpisodes(html)
                 episodes.also { episodeCache[key] = it }
             }

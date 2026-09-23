@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.soap4tv.app.data.model.ContinueWatchingItem
+import com.soap4tv.app.ui.components.LoadingIndicator
 import com.soap4tv.app.ui.components.PosterCard
 import com.soap4tv.app.ui.screen.catalog.CatalogViewModel
 import com.soap4tv.app.ui.theme.*
@@ -40,6 +41,11 @@ fun MyContentScreen(
 
     val hasContent = localHistory.isNotEmpty() || continueWatching.isNotEmpty() ||
         mySeries.isNotEmpty() || bookmarkedMovies.isNotEmpty()
+
+    if (!hasContent && catalogViewModel.isLoadingMyPage) {
+        LoadingIndicator()
+        return
+    }
 
     if (!hasContent) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

@@ -6,6 +6,7 @@ import com.soap4tv.app.data.model.Series
 import com.soap4tv.app.data.network.SoapApiClient
 import com.soap4tv.app.data.parser.CatalogParser
 import com.soap4tv.app.data.parser.MovieCatalogParser
+import com.soap4tv.app.data.parser.parseOnWorker
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
@@ -17,7 +18,8 @@ enum class SortOption {
 
 @Singleton
 class CatalogRepository @Inject constructor(
-    private val apiClient: SoapApiClient
+    private val apiClient: SoapApiClient,
+    private val mainPage: MainPageSource
 ) {
     @Volatile private var cachedSeries: List<Series>? = null
     @Volatile private var cachedMovies: List<Movie>? = null
@@ -35,7 +37,7 @@ class CatalogRepository @Inject constructor(
         if (!forceRefresh) cachedSeries?.let { return Result.success(it) }
         return seriesLock.withLock {
             if (!forceRefresh) cachedSeries?.let { return@withLock Result.success(it) }
-            apiClient.fetchPage("/").map { html ->
+            mainPage.html(forceRefresh = forceRefresh).parseOnWorker { html ->
                 CatalogParser.parseSeries(html).also { cachedSeries = it }
             }
         }
@@ -45,7 +47,7 @@ class CatalogRepository @Inject constructor(
         if (!forceRefresh) cachedMovies?.let { return Result.success(it) }
         return moviesLock.withLock {
             if (!forceRefresh) cachedMovies?.let { return@withLock Result.success(it) }
-            apiClient.fetchPage("/movies/").map { html ->
+            apiClient.fetchPage("/movies/").parseOnWorker { html ->
                 MovieCatalogParser.parseMovies(html).also { cachedMovies = it }
             }
         }
@@ -99,7 +101,7 @@ class CatalogRepository @Inject constructor(
                 val my = cachedMySeries
                 if (cw != null && my != null) return@withLock Result.success(cw to my)
             }
-            apiClient.fetchPage("/sort/my/").map { html ->
+            apiClient.fetchPage("/sort/my/").parseOnWorker { html ->
                 val cw = CatalogParser.parseContinueWatching(html)
                 val series = CatalogParser.parseSeries(html)
                 cachedContinueWatching = cw
@@ -113,7 +115,7 @@ class CatalogRepository @Inject constructor(
         if (!forceRefresh) cachedBookmarkedMovies?.let { return Result.success(it) }
         return bookmarksLock.withLock {
             if (!forceRefresh) cachedBookmarkedMovies?.let { return@withLock Result.success(it) }
-            apiClient.fetchPage("/movies/bookmarks/").map { html ->
+            apiClient.fetchPage("/movies/bookmarks/").parseOnWorker { html ->
                 MovieCatalogParser.parseMovies(html).also { cachedBookmarkedMovies = it }
             }
         }
@@ -124,6 +126,7 @@ class CatalogRepository @Inject constructor(
     }
 
     fun invalidateCache() {
+        mainPage.invalidate()
         cachedSeries = null
         cachedMovies = null
         cachedBookmarkedMovies = null

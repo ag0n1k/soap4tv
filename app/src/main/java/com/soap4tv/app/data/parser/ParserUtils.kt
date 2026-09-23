@@ -1,6 +1,9 @@
 package com.soap4tv.app.data.parser
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.jsoup.nodes.Element
 
 private const val TAG = "Soap4tvParser"
@@ -30,3 +33,28 @@ internal inline fun <T, R : Any> Iterable<T>.mapNotNullLogging(
         null
     }
 }
+
+/**
+ * Parse an HTML payload on a worker thread and fold parser failures into the [Result].
+ *
+ * `SoapApiClient` hands back a String from `Dispatchers.IO`, but `Result.map` is inline, so
+ * a `fetchPage(...).map { Parser.parse(it) }` chain used to run the Jsoup parse on the
+ * caller's dispatcher — for repositories called from a `viewModelScope` that is the main
+ * thread, freezing the UI for the whole parse of a catalog page. A throwing parser also
+ * escaped as an uncaught exception instead of an error state; here it becomes a failure.
+ */
+internal suspend fun <T, R> Result<T>.parseOnWorker(transform: (T) -> R): Result<R> = fold(
+    onSuccess = { value ->
+        withContext(Dispatchers.Default) {
+            try {
+                Result.success(transform(value))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Parse failed — ${e.javaClass.simpleName}: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    },
+    onFailure = { Result.failure(it) }
+)

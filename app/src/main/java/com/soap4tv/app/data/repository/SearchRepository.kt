@@ -5,6 +5,7 @@ import com.soap4tv.app.data.model.Series
 import com.soap4tv.app.data.network.SoapApiClient
 import com.soap4tv.app.data.parser.CatalogParser
 import com.soap4tv.app.data.parser.MovieCatalogParser
+import com.soap4tv.app.data.parser.parseOnWorker
 import org.jsoup.Jsoup
 import java.net.URLEncoder
 import javax.inject.Inject
@@ -22,7 +23,7 @@ class SearchRepository @Inject constructor(
         if (query.isBlank()) return Result.success(Pair(emptyList(), emptyList()))
 
         val encoded = URLEncoder.encode(query.trim(), "UTF-8")
-        return apiClient.fetchPage("/search/?q=$encoded").map { html ->
+        return apiClient.fetchPage("/search/?q=$encoded").parseOnWorker { html ->
             val doc = Jsoup.parse(html)
 
             // Parse series results (id="soap-{id}")

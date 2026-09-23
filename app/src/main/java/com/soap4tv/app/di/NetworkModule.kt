@@ -3,6 +3,7 @@ package com.soap4tv.app.di
 import android.app.Application
 import coil3.ImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
+import com.soap4tv.app.data.network.ImageHttp
 import com.soap4tv.app.data.network.PlayerHttp
 import com.soap4tv.app.data.network.PlayerHttpEventListener
 import com.soap4tv.app.data.network.RetryInterceptor
@@ -12,6 +13,7 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 import javax.inject.Singleton
@@ -25,6 +27,10 @@ object NetworkModule {
     fun provideOkHttpClient(cookieJar: SoapCookieJar): OkHttpClient {
         return OkHttpClient.Builder()
             .cookieJar(cookieJar)
+            // Everything lives on one host, and OkHttp's default cap of 5 requests per host
+            // is shared queue-wide: the startup burst of catalog pages would otherwise block
+            // each other. Posters have their own client below.
+            .dispatcher(Dispatcher().apply { maxRequestsPerHost = 8 })
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
@@ -51,9 +57,31 @@ object NetworkModule {
             .eventListenerFactory { PlayerHttpEventListener() }
             .build()
 
+    /**
+     * Posters get their own client so they queue independently of API traffic. Sharing one
+     * meant a screenful of covers waited behind the catalog HTML (same host, same dispatcher)
+     * and vice versa. No retry interceptor here: a poster that 503s is not worth parking a
+     * thread in `Thread.sleep` — it will be requested again when it scrolls back into view.
+     */
     @Provides
     @Singleton
-    fun provideImageLoader(application: Application, okHttpClient: OkHttpClient): ImageLoader {
+    @ImageHttp
+    fun provideImageOkHttpClient(cookieJar: SoapCookieJar): OkHttpClient =
+        OkHttpClient.Builder()
+            .cookieJar(cookieJar)
+            .dispatcher(Dispatcher().apply { maxRequestsPerHost = 8 })
+            .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .build()
+
+    @Provides
+    @Singleton
+    fun provideImageLoader(
+        application: Application,
+        @ImageHttp okHttpClient: OkHttpClient
+    ): ImageLoader {
         return ImageLoader.Builder(application)
             .components {
                 add(OkHttpNetworkFetcherFactory(callFactory = okHttpClient))

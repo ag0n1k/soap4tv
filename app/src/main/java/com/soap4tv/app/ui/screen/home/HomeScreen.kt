@@ -40,6 +40,8 @@ fun HomeScreen(
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("Сериалы", "Фильмы", "Моё")
 
+    LaunchedEffect(selectedTab) { catalogViewModel.onTabSelected(selectedTab) }
+
     Column(
         modifier = Modifier
             .fillMaxSize()

@@ -3,6 +3,7 @@ package com.soap4tv.app.data.repository
 import com.soap4tv.app.data.model.MovieDetail
 import com.soap4tv.app.data.network.SoapApiClient
 import com.soap4tv.app.data.parser.MovieDetailParser
+import com.soap4tv.app.data.parser.parseOnWorker
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
@@ -25,7 +26,7 @@ class MovieRepository @Inject constructor(
             if (!forceRefresh) {
                 detailCache[id]?.let { return@withLock Result.success(it) }
             }
-            apiClient.fetchPage("/movies/$id/").map { html ->
+            apiClient.fetchPage("/movies/$id/").parseOnWorker { html ->
                 MovieDetailParser.parseMovieDetail(html, id).also { detailCache[id] = it }
             }
         }
