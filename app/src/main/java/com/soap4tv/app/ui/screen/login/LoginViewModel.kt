@@ -24,6 +24,21 @@ class LoginViewModel @Inject constructor(
     var error by mutableStateOf<String?>(null)
         private set
 
+    /** True once stored credentials have been filled in, so the screen can focus the button. */
+    var isPrefilled by mutableStateOf(false)
+        private set
+
+    init {
+        viewModelScope.launch {
+            val saved = authRepository.savedCredentials() ?: return@launch
+            if (username.isBlank() && password.isBlank()) {
+                username = saved.username
+                password = saved.password
+                isPrefilled = true
+            }
+        }
+    }
+
     fun onUsernameChange(value: String) {
         username = value
         error = null

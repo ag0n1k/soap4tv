@@ -158,9 +158,10 @@ fun LoginScreen(
         }
     }
 
-    // Auto-focus username field on first display
-    LaunchedEffect(Unit) {
-        focusUsername.requestFocus()
+    // Auto-focus the username field, or the login button when stored credentials were
+    // restored — then signing back in is a single click on the remote.
+    LaunchedEffect(viewModel.isPrefilled) {
+        if (viewModel.isPrefilled) focusButton.requestFocus() else focusUsername.requestFocus()
     }
 }
 

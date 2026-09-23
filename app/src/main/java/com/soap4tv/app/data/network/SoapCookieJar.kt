@@ -10,6 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import android.util.Log
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
@@ -25,8 +26,10 @@ class SoapCookieJar @Inject constructor(
 ) : CookieJar {
 
     companion object {
+        private const val TAG = "SoapCookieJar"
         private val COOKIES_KEY = stringPreferencesKey("cookies")
         private const val TARGET_DOMAIN = "soap4youand.me"
+        private const val SESSION_COOKIE = "PHPSESSID"
     }
 
     // Singleton-scoped, app-lifetime coroutine for async persistence.
@@ -61,8 +64,19 @@ class SoapCookieJar @Inject constructor(
         if (cookies.isEmpty()) return
         ensureLoaded()
 
-        cookies.forEach { cookieCache[it.name] = it }
-        persistAsync()
+        var changed = false
+        cookies.forEach { cookie ->
+            if (isDeletion(cookie) && cookieCache[cookie.name]?.let { !isDeletion(it) } == true) {
+                // A blank or already-expired Set-Cookie for a name we still hold is almost
+                // always an error page, a WAF challenge or a redirect to /login/. Honouring
+                // it would destroy a live session that the very next request would have used.
+                Log.w(TAG, "Ignoring deletion cookie for ${cookie.name} from ${url.host}")
+                return@forEach
+            }
+            cookieCache[cookie.name] = cookie
+            changed = true
+        }
+        if (changed) persistAsync()
     }
 
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
@@ -83,10 +97,24 @@ class SoapCookieJar @Inject constructor(
         }
     }
 
-    fun hasCookies(): Boolean {
+    /** True when a usable, unexpired session cookie is stored. */
+    fun hasSession(): Boolean {
         ensureLoaded()
-        return cookieCache.containsKey("PHPSESSID")
+        val cookie = cookieCache[SESSION_COOKIE] ?: return false
+        return !isDeletion(cookie)
     }
+
+    /**
+     * Read the persisted jar ahead of the first request. [ensureLoaded] blocks on DataStore
+     * plus a Keystore decrypt; doing that lazily puts it on whichever thread happens to make
+     * the first call, which at startup is the one the UI is waiting on.
+     */
+    fun prewarm() {
+        persistenceScope.launch { ensureLoaded() }
+    }
+
+    private fun isDeletion(cookie: Cookie): Boolean =
+        cookie.value.isBlank() || (cookie.persistent && cookie.expiresAt <= System.currentTimeMillis())
 
     private fun persistAsync() {
         val snapshot = cookieCache.values.toList()
